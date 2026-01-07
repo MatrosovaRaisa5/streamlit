@@ -1,0 +1,486 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import SimpleImputer, IterativeImputer
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder, LabelEncoder
+from sklearn.decomposition import PCA
+from sklearn.metrics import (accuracy_score, recall_score, f1_score, precision_score,
+                             confusion_matrix, ConfusionMatrixDisplay,
+                             roc_curve, auc, classification_report, roc_auc_score)
+import optuna
+from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from imblearn.over_sampling import SMOTE
+import warnings
+
+warnings.filterwarnings('ignore')
+
+st.set_page_config(
+    page_title="Dashboard",
+    layout="wide"
+)
+
+
+@st.cache_data
+def load_data(uploaded_file=None):
+    if uploaded_file is not None:
+        try:
+            for encoding in ['utf-8', 'cp1251', 'latin1', 'ISO-8859-1']:
+                try:
+                    df = pd.read_csv(uploaded_file, encoding=encoding)
+                    df = df.sample(50000, random_state=42)
+                    return df
+                except:
+                    continue
+            df = pd.read_csv(uploaded_file, encoding='utf-8')
+            df = df.sample(50000, random_state=42)
+            return df
+        except Exception as e:
+            st.error(f"Ошибка загрузки файла: {e}")
+            return None
+    else:
+        from sklearn.datasets import make_classification
+        X, y = make_classification(
+            n_samples=1000,
+            n_features=10,
+            n_classes=2,
+            weights=[0.8, 0.2],
+            random_state=42
+        )
+        feature_names = [f'feature_{i}' for i in range(10)]
+        df = pd.DataFrame(X, columns=feature_names)
+        df['target'] = y
+        return df
+
+def main():
+    st.title("Дашборд для классификации")
+    st.markdown("---")
+
+    with st.sidebar:
+        st.header("Загрузка данных")
+        uploaded_file = st.file_uploader(
+            "Загрузите CSV файл",
+            type=['csv']
+        )
+
+        st.header("Настройки")
+        target_col = st.text_input("Имя целевой переменной", "target")
+
+        if st.button("Запустить анализ", type="primary", use_container_width=True):
+            st.session_state.run_analysis = True
+        else:
+            if 'run_analysis' not in st.session_state:
+                st.session_state.run_analysis = False
+
+        st.markdown("---")
+        st.markdown("**by Матросова Раиса**")
+
+    tab1, tab2 = st.tabs(["Предобработка+Визуализация", "Моделирование"])
+
+    df = load_data(uploaded_file)
+
+    if df is None and uploaded_file is not None:
+        st.error("Не удалось загрузить данные")
+        return
+
+    if df is not None:
+        # Вкладка 1: Предобработка и Визуализация
+        with tab1:
+            st.header("Предобработка данных")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Количество строк", len(df))
+            with col2:
+                st.metric("Количество столбцов", len(df.columns))
+
+            with st.expander("Просмотр данных", expanded=False):
+                st.dataframe(df.head())
+
+            if df.isnull().sum().sum() > 0:
+                missing_df = pd.DataFrame({
+                    'Колонка': df.columns,
+                    'Пропуски': df.isnull().sum().values,
+                    '% Пропусков': (df.isnull().sum() / len(df) * 100).round(2)
+                })
+                st.dataframe(missing_df[missing_df['Пропуски'] > 0])
+
+            if target_col in df.columns:
+                # Кнопка предобработки с разделением логики
+                if 'data_preprocessed' not in st.session_state:
+                    st.session_state.data_preprocessed = False
+
+                if not st.session_state.data_preprocessed:
+                    if st.button("Подготовить данные", type="secondary"):
+                        st.session_state.prepare_data = True
+                else:
+                    st.success("Данные уже подготовлены!")
+
+                if 'prepare_data' in st.session_state and st.session_state.prepare_data:
+                    with st.spinner("Подготовка данных"):
+                        df_clean = df.copy()
+                        mask = df_clean[target_col].notna()
+                        df_clean = df_clean[mask].copy()
+
+                        X = df_clean.drop(columns=[target_col])
+                        y = df_clean[target_col]
+
+                        st.info(f"После удаления пропусков в целевой переменной: {len(df_clean)} строк")
+
+                        if y.dtype == 'object':
+                            le = LabelEncoder()
+                            y_encoded = le.fit_transform(y)
+                            st.success(
+                                f"Целевая переменная закодирована: {list(le.classes_)} → {list(range(len(le.classes_)))}")
+                            st.session_state.label_encoder = le
+                        else:
+                            y_encoded = y.values
+
+                        X_train, X_test, y_train, y_test = train_test_split(
+                            X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
+
+                        st.info(f"Разделение: Train={X_train.shape}, Test={X_test.shape}")
+
+                        cat_cols = X_train.select_dtypes(include=['object']).columns.tolist()
+                        if len(cat_cols) > 0:
+                            cat_imputer = SimpleImputer(strategy='most_frequent')
+                            X_train[cat_cols] = cat_imputer.fit_transform(X_train[cat_cols])
+                            X_test[cat_cols] = cat_imputer.transform(X_test[cat_cols])
+                            st.success(f"Обработаны категориальные признаки: {len(cat_cols)}")
+
+                        num_cols = X_train.select_dtypes(include=['int64', 'float64']).columns.tolist()
+                        if len(num_cols) > 0:
+                            num_imputer = IterativeImputer(random_state=42, max_iter=10)
+                            X_train[num_cols] = num_imputer.fit_transform(X_train[num_cols])
+                            X_test[num_cols] = num_imputer.transform(X_test[num_cols])
+                            st.success(f"Обработаны числовые признаки: {len(num_cols)}")
+
+                        st.session_state.X_for_viz = X.copy()
+                        st.session_state.cat_cols_viz = cat_cols.copy()
+                        st.session_state.num_cols_viz = num_cols.copy()
+
+                        if len(cat_cols) > 0:
+                            binary_cat_cols = []
+                            for col in cat_cols:
+                                if X_train[col].nunique() == 2:
+                                    binary_cat_cols.append(col)
+
+                            if binary_cat_cols:
+                                oe = OrdinalEncoder()
+                                for col in binary_cat_cols:
+                                    try:
+                                        X_train[col] = oe.fit_transform(X_train[[col]])
+                                        X_test[col] = oe.transform(X_test[[col]])
+                                    except:
+                                        le_col = LabelEncoder()
+                                        X_train[col] = le_col.fit_transform(X_train[col])
+                                        X_test[col] = le_col.transform(X_test[col])
+
+                            non_binary_cat = [col for col in cat_cols if col not in binary_cat_cols]
+                            if non_binary_cat:
+                                X_train = pd.get_dummies(X_train, columns=non_binary_cat, drop_first=True)
+                                X_test = pd.get_dummies(X_test, columns=non_binary_cat, drop_first=True)
+                                train_cols = X_train.columns
+                                test_cols = X_test.columns
+                                missing_cols = set(train_cols) - set(test_cols)
+                                for col in missing_cols:
+                                    X_test[col] = 0
+                                X_test = X_test[train_cols]
+
+                        smote = SMOTE(random_state=42)
+                        X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+
+                        unique_before, counts_before = np.unique(y_train, return_counts=True)
+                        unique_after, counts_after = np.unique(y_train_resampled, return_counts=True)
+
+                        st.success("SMOTE применен успешно!")
+                        st.write(f"До SMOTE: {dict(zip(unique_before, counts_before))}")
+                        st.write(f"После SMOTE: {dict(zip(unique_after, counts_after))}")
+
+                        X_train = X_train_resampled
+                        y_train = y_train_resampled
+
+                        if len(num_cols) > 0:
+                            train_clean = X_train.copy()
+                            test_clean = X_test.copy()
+
+                            for col in num_cols:
+                                if col in train_clean.columns:
+                                    Q1 = train_clean[col].quantile(0.1)
+                                    Q3 = train_clean[col].quantile(0.9)
+                                    IQR = Q3 - Q1
+                                    lower = Q1 - 1.5 * IQR
+                                    upper = Q3 + 1.5 * IQR
+
+                                    train_clean[col] = np.clip(train_clean[col], lower, upper)
+                                    if col in test_clean.columns:
+                                        test_clean[col] = np.clip(test_clean[col], lower, upper)
+
+                            X_train = train_clean
+                            X_test = test_clean
+
+                        if len(num_cols) > 0:
+                            scaler = StandardScaler()
+                            current_num_cols = [col for col in num_cols if col in X_train.columns]
+                            if current_num_cols:
+                                X_train[current_num_cols] = scaler.fit_transform(X_train[current_num_cols])
+                                X_test[current_num_cols] = scaler.transform(X_test[current_num_cols])
+                                st.session_state.scaler = scaler
+
+                        if X_train.shape[1] > 10:
+                            pca = PCA(n_components=0.9)
+                            X_train = pca.fit_transform(X_train)
+                            X_test = pca.transform(X_test)
+                            explained_variance = np.sum(pca.explained_variance_ratio_)
+                            st.success(
+                                f"PCA применен: {X_train.shape[1]} компонент, объясненная дисперсия: {explained_variance:.2%}")
+                            st.session_state.pca = pca
+
+                        st.session_state.X_train = X_train
+                        st.session_state.X_test = X_test
+                        st.session_state.y_train = y_train
+                        st.session_state.y_test = y_test
+                        st.session_state.feature_names = X_train.columns.tolist() if hasattr(X_train, 'columns') else [
+                            f'feature_{i}' for i in range(X_train.shape[1])]
+
+                        st.session_state.data_preprocessed = True
+                        st.session_state.prepare_data = False
+
+                        st.success(f"Данные подготовлены. Train: {X_train.shape}, Test: {X_test.shape}")
+
+                        unique_classes, class_counts = np.unique(y_train, return_counts=True)
+                        st.subheader("Распределение классов в обучающих данных")
+
+                        for cls, count in zip(unique_classes, class_counts):
+                            percentage = count / len(y_train) * 100
+                            st.write(f"Класс {cls}: {count} примеров ({percentage:.1f}%)")
+
+                if st.session_state.data_preprocessed:
+                    st.header("Визуализация данных")
+
+                    X_for_viz = st.session_state.X_for_viz
+                    cat_cols = st.session_state.cat_cols_viz
+                    num_cols = st.session_state.num_cols_viz
+
+                    viz_container = st.container()
+
+                    with viz_container:
+                        if len(cat_cols) > 0:
+                            st.subheader("Круговые диаграммы для категориальных признаков")
+                            selected_cat = st.selectbox("Выберите признак",
+                                                        cat_cols[:min(5, len(cat_cols))],
+                                                        key='cat_select')
+
+                            if selected_cat in X_for_viz.columns:
+                                value_counts = X_for_viz[selected_cat].value_counts().head(10)
+                                fig, ax = plt.subplots(figsize=(8, 6))
+                                ax.pie(value_counts.values, labels=value_counts.index, autopct='%1.1f%%')
+                                ax.set_title(f"Распределение: {selected_cat}")
+                                st.pyplot(fig)
+
+                        if len(num_cols) > 0:
+                            st.subheader("Распределение числовых признаков")
+                            selected_num = st.selectbox("Выберите признак",
+                                                        num_cols[:min(5, len(num_cols))],
+                                                        key='num_select')
+                            if selected_num in X_for_viz.columns:
+                                fig, ax = plt.subplots(figsize=(8, 5))
+                                ax.hist(X_for_viz[selected_num].dropna(), bins=30, edgecolor='black', alpha=0.7)
+                                ax.set_title(f"Распределение: {selected_num}")
+                                ax.set_xlabel(selected_num)
+                                ax.set_ylabel("Частота")
+                                ax.grid(True, alpha=0.3)
+                                st.pyplot(fig)
+
+                        if len(num_cols) > 0:
+                            st.subheader("Boxplot для числовых признаков")
+                            selected_box = st.multiselect(
+                                "Выберите признаки",
+                                num_cols[:min(5, len(num_cols))],
+                                default=num_cols[:min(3, len(num_cols))],
+                                key='box_select'
+                            )
+                            if selected_box:
+                                fig, ax = plt.subplots(figsize=(10, 6))
+                                data_to_plot = [X_for_viz[col].dropna() for col in selected_box]
+                                ax.boxplot(data_to_plot, labels=selected_box)
+                                ax.set_title("Boxplot выбранных признаков")
+                                ax.set_ylabel("Значения")
+                                ax.grid(True, alpha=0.3)
+                                plt.xticks(rotation=45)
+                                st.pyplot(fig)
+
+                        if len(num_cols) >= 2:
+                            st.subheader("Парные отношения признаков")
+                            col1 = st.selectbox("Первый признак", num_cols, key='pair1')
+                            col2 = st.selectbox("Второй признак", [c for c in num_cols if c != col1], key='pair2')
+
+                            fig, ax = plt.subplots(figsize=(8, 6))
+                            scatter = ax.scatter(X_for_viz[col1], X_for_viz[col2], alpha=0.5, s=20)
+                            ax.set_xlabel(col1)
+                            ax.set_ylabel(col2)
+                            ax.set_title(f'Парные отношения: {col1} vs {col2}')
+                            ax.grid(True, alpha=0.3)
+                            st.pyplot(fig)
+
+                        if len(num_cols) > 1:
+                            st.subheader("Корреляционная матрица")
+                            fig, ax = plt.subplots(figsize=(10, 8))
+                            corr_matrix = X_for_viz[num_cols].corr()
+                            sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='coolwarm',
+                                        center=0, ax=ax, square=True, cbar_kws={"shrink": 0.8})
+                            ax.set_title('Корреляционная матрица числовых признаков')
+                            st.pyplot(fig)
+            else:
+                st.error(f"Целевая переменная '{target_col}' не найдена")
+
+        # Вкладка 2: Моделирование
+        with tab2:
+            st.header("Моделирование")
+
+            if 'X_train' in st.session_state:
+                X_train = st.session_state.X_train
+                X_test = st.session_state.X_test
+                y_train = st.session_state.y_train
+                y_test = st.session_state.y_test
+                feature_names = st.session_state.feature_names
+
+                model_choice = st.selectbox(
+                    "Выберите модель",
+                    ["XGBoost", "Random Forest", "Logistic Regression"]
+                )
+
+                n_trials = st.slider("Количество испытаний Optuna", 5, 30, 10)
+
+                if st.button("Обучить модель", type="primary", use_container_width=True):
+                    with st.spinner("Обучение модели с помощью Optuna"):
+                        def objective(trial):
+                            if model_choice == "XGBoost":
+                                params = {
+                                    'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                                    'max_depth': trial.suggest_int('max_depth', 3, 10),
+                                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+                                    'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                                    'random_state': 42
+                                }
+                                model = XGBClassifier(**params, use_label_encoder=False, eval_metric='logloss')
+
+                            elif model_choice == "Random Forest":
+                                params = {
+                                    'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                                    'max_depth': trial.suggest_int('max_depth', 3, 20),
+                                    'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+                                    'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
+                                    'random_state': 42
+                                }
+                                model = RandomForestClassifier(**params)
+
+                            else:  # Logistic Regression
+                                params = {
+                                    'C': trial.suggest_float('C', 0.01, 10.0, log=True),
+                                    'max_iter': trial.suggest_int('max_iter', 100, 1000),
+                                    'random_state': 42
+                                }
+                                model = LogisticRegression(**params)
+
+                            score = cross_val_score(model, X_train, y_train, cv=3, scoring='roc_auc').mean()
+                            return score
+
+                        study = optuna.create_study(direction='maximize')
+                        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+                        best_params = study.best_params
+                        st.success(f"Лучшие параметры: {best_params}")
+
+                        if model_choice == "XGBoost":
+                            model = XGBClassifier(**best_params, use_label_encoder=False,
+                                                  eval_metric='logloss', random_state=42)
+                        elif model_choice == "Random Forest":
+                            model = RandomForestClassifier(**best_params, random_state=42)
+                        else:
+                            model = LogisticRegression(**best_params, random_state=42)
+
+                        model.fit(X_train, y_train)
+
+                        y_pred = model.predict(X_test)
+                        y_pred_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
+
+                        st.subheader("Метрики модели")
+
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            accuracy = accuracy_score(y_test, y_pred)
+                            st.metric("Accuracy", f"{accuracy:.3f}")
+                        with col2:
+                            precision = precision_score(y_test, y_pred, average='weighted')
+                            st.metric("Precision", f"{precision:.3f}")
+                        with col3:
+                            recall = recall_score(y_test, y_pred, average='weighted')
+                            st.metric("Recall", f"{recall:.3f}")
+                        with col4:
+                            f1 = f1_score(y_test, y_pred, average='weighted')
+                            st.metric("F1-Score", f"{f1:.3f}")
+
+                        if y_pred_proba is not None:
+                            try:
+                                roc_auc = roc_auc_score(y_test, y_pred_proba)
+                                st.metric("ROC-AUC", f"{roc_auc:.3f}")
+                            except:
+                                pass
+
+                        st.subheader("Примеры предсказаний")
+                        n_samples = min(5, len(X_test))
+                        sample_indices = np.random.choice(len(X_test), n_samples, replace=False)
+
+                        predictions_df = pd.DataFrame({
+                            'Фактический': y_test[sample_indices],
+                            'Предсказанный': y_pred[sample_indices]
+                        })
+
+                        st.dataframe(predictions_df)
+
+                        st.subheader("Матрица ошибок")
+                        fig, ax = plt.subplots(figsize=(6, 5))
+                        cm = confusion_matrix(y_test, y_pred)
+                        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+                        disp.plot(ax=ax, cmap='Blues')
+                        ax.set_title("Матрица ошибок")
+                        st.pyplot(fig)
+
+                        if y_pred_proba is not None:
+                            st.subheader("ROC-кривая")
+                            fig, ax = plt.subplots(figsize=(6, 5))
+                            fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+                            roc_auc = auc(fpr, tpr)
+
+                            ax.plot(fpr, tpr, color='darkorange', lw=2,
+                                    label=f'ROC curve (AUC = {roc_auc:.3f})')
+                            ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+                            ax.set_xlim([0.0, 1.0])
+                            ax.set_ylim([0.0, 1.05])
+                            ax.set_xlabel('False Positive Rate')
+                            ax.set_ylabel('True Positive Rate')
+                            ax.set_title('ROC Curve')
+                            ax.legend(loc="lower right")
+                            ax.grid(True, alpha=0.3)
+                            st.pyplot(fig)
+
+                        st.subheader("Отчет по классификации")
+                        report = classification_report(y_test, y_pred, output_dict=True)
+                        report_df = pd.DataFrame(report).transpose()
+                        st.dataframe(report_df.style.format("{:.3f}"))
+
+            else:
+                st.info("Сначала подготовьте данные на вкладке 'Предобработка'")
+    else:
+        st.info("Загрузите CSV файл или используйте демо-данные для начала работы")
+
+
+if __name__ == "__main__":
+    main()
