@@ -1,0 +1,675 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import KNNImputer
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder, LabelEncoder
+from sklearn.decomposition import PCA
+from sklearn.metrics import (accuracy_score, recall_score, f1_score, precision_score,
+                             confusion_matrix, ConfusionMatrixDisplay,
+                             roc_curve, auc, classification_report, roc_auc_score)
+import optuna
+from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelBinarizer
+import warnings
+
+warnings.filterwarnings('ignore')
+
+st.set_page_config(
+    page_title="Dashboard для классификации активности",
+    layout="wide"
+)
+
+@st.cache_data
+def load_data(uploaded_file=None):
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file, sep='$')
+            return df
+        except Exception as e:
+            st.error(f"Ошибка загрузки файла: {e}")
+            return None
+    return None
+
+def preprocess_data(X_train_raw, X_test_raw, y_train_raw, y_test_raw):
+    """Функция предобработки данных как в ноутбуке"""
+    X_train = X_train_raw.copy()
+    X_test = X_test_raw.copy()
+    y_train = y_train_raw.copy()
+    y_test = y_test_raw.copy()
+    
+    # 1. Заполнение пропусков KNNImputer
+    num_cols = [col for col in X_train.columns if (X_train[col].dtype == 'int64' or X_train[col].dtype == 'float64')]
+    
+    if num_cols:
+        imputer = KNNImputer(n_neighbors=5)
+        X_train[num_cols] = imputer.fit_transform(X_train[num_cols])
+        X_test[num_cols] = imputer.transform(X_test[num_cols])
+    
+    # 2. Обработка выбросов методом IQR
+    def iqr_processing(X_train, X_test):
+        train_clean = X_train.copy()
+        test_clean = X_test.copy()
+        columns = [col for col in X_train.columns if (X_train[col].dtype == 'int64' or X_train[col].dtype == 'float64')]
+        for col in columns:
+            Q1 = X_train[col].quantile(0.1)
+            Q3 = X_train[col].quantile(0.9)
+            IQR = Q3 - Q1
+            lower = Q1 - 1.5*IQR
+            upper = Q3 + 1.5*IQR
+
+            train_clean[col] = np.clip(train_clean[col], lower, upper)
+            test_clean[col] = np.clip(test_clean[col], lower, upper)
+
+        return train_clean, test_clean
+    
+    X_train, X_test = iqr_processing(X_train, X_test)
+    
+    # 3. Кодирование категориальных переменных
+    cat_cols = X_train.select_dtypes(include=['object']).columns.tolist()
+    
+    for col in cat_cols:
+        if col == 'gender' and 'female' in X_train[col].values and 'male' in X_train[col].values:
+            oe = OrdinalEncoder(categories=[['female', 'male']])
+            X_train[col] = oe.fit_transform(X_train[[col]])
+            X_test[col] = oe.transform(X_test[[col]])
+        elif col == 'race':
+            unique_races = sorted(X_train[col].unique())
+            oe = OrdinalEncoder(categories=[unique_races])
+            X_train[col] = oe.fit_transform(X_train[[col]])
+            X_test[col] = oe.transform(X_test[[col]])
+    
+    # 4. Масштабирование
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # 5. PCA
+    pca = PCA(0.95)
+    X_train_pca = pca.fit_transform(X_train_scaled)
+    X_test_pca = pca.transform(X_test_scaled)
+    
+    return X_train_pca, X_test_pca, y_train, y_test, scaler, pca
+
+# Функции оптимизации моделей
+def xgb_optimize_multiclass_clf(X_train, y_train, X_test, y_test, n_trials=10):
+    """Оптимизация XGBoost для многоклассовой классификации"""
+    n_classes = len(np.unique(y_train))
+    
+    def objective(trial):
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 150, 300),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'random_state': 42,
+            'n_jobs': -1,
+            'eval_metric': 'mlogloss',
+            'use_label_encoder': False
+        }
+        
+        if n_classes > 2:
+            params['objective'] = 'multi:softprob'
+            params['num_class'] = n_classes
+        
+        model = XGBClassifier(**params)
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        
+        try:
+            scores = cross_val_score(model, X_train, y_train, 
+                                     cv=cv, scoring='accuracy', 
+                                     n_jobs=-1, error_score='raise')
+            score = np.mean(scores)
+            if np.isnan(score):
+                return -float('inf')
+            return score
+        except Exception:
+            return -float('inf')
+    
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    best_params = study.best_params
+    best_params['random_state'] = 42
+    best_params['n_jobs'] = -1
+    best_params['use_label_encoder'] = False
+    best_params['eval_metric'] = 'mlogloss'
+    
+    if n_classes > 2:
+        best_params['objective'] = 'multi:softprob'
+        best_params['num_class'] = n_classes
+    
+    model = XGBClassifier(**best_params)
+    model.fit(X_train, y_train)
+    
+    return model, best_params, study
+
+def rf_optimize_multiclass_clf(X_train, y_train, X_test, y_test, n_trials=10):
+    """Оптимизация Random Forest для многоклассовой классификации"""
+    n_classes = len(np.unique(y_train))
+    
+    def objective(trial):
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 100, 300),
+            'max_depth': trial.suggest_int('max_depth', 3, 20),
+            'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
+            'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2', None]),
+            'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
+            'criterion': trial.suggest_categorical('criterion', ['gini', 'entropy']),
+            'random_state': 42,
+            'n_jobs': -1
+        }
+        
+        model = RandomForestClassifier(**params)
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        
+        try:
+            scores = cross_val_score(model, X_train, y_train, 
+                                     cv=cv, scoring='accuracy', 
+                                     n_jobs=-1, error_score='raise')
+            score = np.mean(scores)
+            if np.isnan(score):
+                return -float('inf')
+            return score
+        except Exception:
+            return -float('inf')
+    
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    best_params = study.best_params
+    best_params['random_state'] = 42
+    best_params['n_jobs'] = -1
+    
+    model = RandomForestClassifier(**best_params)
+    model.fit(X_train, y_train)
+    
+    return model, best_params, study
+
+def lr_optimize_multiclass_clf(X_train, y_train, X_test, y_test, n_trials=10):
+    """Оптимизация Logistic Regression для многоклассовой классификации"""
+    n_classes = len(np.unique(y_train))
+    
+    def objective(trial):
+        solver = trial.suggest_categorical('solver', ['lbfgs', 'newton-cg', 'sag', 'saga'])
+        
+        if solver in ['newton-cg', 'lbfgs', 'sag']:
+            penalty = trial.suggest_categorical('penalty', ['l2', 'none'])
+        elif solver == 'saga':
+            penalty = trial.suggest_categorical('penalty', ['l1', 'l2', 'elasticnet', 'none'])
+        else:
+            penalty = 'l2'
+        
+        params = {
+            'C': trial.suggest_float('C', 0.01, 10.0, log=True),
+            'solver': solver,
+            'penalty': penalty,
+            'max_iter': trial.suggest_int('max_iter', 100, 1000),
+            'random_state': 42,
+            'n_jobs': -1
+        }
+        
+        if penalty == 'elasticnet':
+            params['l1_ratio'] = trial.suggest_float('l1_ratio', 0, 1)
+            params['solver'] = 'saga'
+        
+        if penalty == 'l1':
+            params['solver'] = 'saga'
+        
+        if penalty == 'none':
+            params['penalty'] = None
+        
+        try:
+            model = LogisticRegression(**params)
+            cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+            
+            scores = cross_val_score(model, X_train, y_train, 
+                                     cv=cv, scoring='accuracy', 
+                                     n_jobs=-1, error_score='raise')
+            score = np.mean(scores)
+            if np.isnan(score):
+                return -float('inf')
+            return score
+        except Exception:
+            return -float('inf')
+    
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    best_params = study.best_params
+    best_params['random_state'] = 42
+    best_params['n_jobs'] = -1
+    
+    if 'penalty' in best_params and best_params['penalty'] == 'none':
+        best_params['penalty'] = None
+    
+    model = LogisticRegression(**best_params)
+    model.fit(X_train, y_train)
+    
+    return model, best_params, study
+
+def main():
+    st.title("Дашборд для классификации активности человека")
+    st.markdown("Анализ данных с акселерометра и гироскопа")
+    
+    with st.sidebar:
+        st.header("Загрузка данных")
+        
+        uploaded_file_X = st.file_uploader(
+            "Загрузите файл с признаками (data.csv)",
+            type=['csv']
+        )
+        
+        uploaded_file_y = st.file_uploader(
+            "Загрузите файл с метками (labels.csv)",
+            type=['csv']
+        )
+        
+        use_demo_data = st.checkbox("Использовать демо-данные", value=False)
+        
+        st.header("Настройки")
+        test_size = st.slider("Размер тестовой выборки (%)", 10, 30, 15)
+        n_trials = st.slider("Количество испытаний Optuna", 5, 50, 10)
+        
+        if st.button("Запустить анализ", type="primary", use_container_width=True):
+            st.session_state.run_analysis = True
+        else:
+            if 'run_analysis' not in st.session_state:
+                st.session_state.run_analysis = False
+        
+        st.markdown("---")
+        st.markdown("**by Матросова Раиса**")
+    
+    tab1, tab2, tab3 = st.tabs(["Данные и предобработка", "Моделирование", "Результаты"])
+    
+    # Загрузка данных
+    if use_demo_data or (uploaded_file_X is not None and uploaded_file_y is not None):
+        with tab1:
+            st.header("Загрузка и предобработка данных")
+            
+            if use_demo_data:
+                # Демо данные
+                st.info("Используются демо-данные")
+                try:
+                    X = pd.read_csv('data.csv', sep='$')
+                    y = pd.read_csv('labels.csv')
+                except:
+                    st.error("Не удалось загрузить демо-данные")
+                    return
+            else:
+                X = pd.read_csv(uploaded_file_X, sep='$')
+                y = pd.read_csv(uploaded_file_y)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Количество строк", len(X))
+            with col2:
+                st.metric("Количество признаков", len(X.columns))
+            
+            with st.expander("Просмотр данных", expanded=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("Признаки")
+                    st.dataframe(X.head())
+                with col2:
+                    st.subheader("Метки")
+                    st.dataframe(y.head())
+            
+            st.subheader("Предобработка данных")
+            
+            # 1. Удаление subj_id
+            if 'subj_id' in X.columns:
+                X = X.drop('subj_id', axis=1)
+                st.success("Удален столбец subj_id")
+            
+            # 2. Объединение данных
+            df = pd.concat([X, y], axis=1)
+            
+            # 3. Удаление ascending stairs
+            if 'activity' in df.columns:
+                initial_shape = df.shape[0]
+                df = df[df['activity'] != 'ascending stairs']
+                removed_count = initial_shape - df.shape[0]
+                st.success(f"Удалено {removed_count} строк с активностью 'ascending stairs'")
+            
+            # 4. Удаление дубликатов
+            initial_shape = df.shape[0]
+            df = df.drop_duplicates()
+            removed_duplicates = initial_shape - df.shape[0]
+            st.success(f"Удалено {removed_duplicates} дубликатов")
+            
+            # 5. Разделение на признаки и целевую
+            X_clean = df.drop('activity', axis=1)
+            y_clean = df['activity']
+            
+            # 6. Разделение на train/test
+            X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(
+                X_clean, y_clean, 
+                test_size=test_size/100, 
+                random_state=42, 
+                stratify=y_clean
+            )
+            
+            st.info(f"Разделение: Train={X_train_raw.shape}, Test={X_test_raw.shape}")
+            
+            # 7. Предобработка
+            with st.spinner("Выполняется предобработка данных..."):
+                X_train_pca, X_test_pca, y_train, y_test, scaler, pca_model = preprocess_data(
+                    X_train_raw, X_test_raw, y_train_raw, y_test_raw
+                )
+            
+            st.success(f"Предобработка завершена! PCA: {X_train_pca.shape[1]} компонент")
+            
+            # Сохраняем данные в session_state
+            st.session_state.X_train = X_train_pca
+            st.session_state.X_test = X_test_pca
+            st.session_state.y_train = y_train
+            st.session_state.y_test = y_test
+            st.session_state.scaler = scaler
+            st.session_state.pca = pca_model
+            
+            # Визуализация
+            st.subheader("Визуализация данных")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                fig, ax = plt.subplots(figsize=(8, 6))
+                y_clean.value_counts().plot(kind='bar', ax=ax)
+                ax.set_title("Распределение активностей")
+                ax.set_xlabel("Активность")
+                ax.set_ylabel("Количество")
+                plt.xticks(rotation=45)
+                st.pyplot(fig)
+            
+            with col2:
+                fig, ax = plt.subplots(figsize=(8, 6))
+                explained_variance = pca_model.explained_variance_ratio_
+                cumsum = np.cumsum(explained_variance)
+                ax.plot(cumsum, marker='o')
+                ax.axhline(y=0.95, color='r', linestyle='--', label='95% дисперсии')
+                ax.set_xlabel("Количество компонент")
+                ax.set_ylabel("Объясненная дисперсия")
+                ax.set_title("Объясненная дисперсия PCA")
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                st.pyplot(fig)
+    
+    # Моделирование
+    with tab2:
+        st.header("Моделирование")
+        
+        if 'X_train' not in st.session_state:
+            st.info("Сначала выполните предобработку данных на вкладке 'Данные и предобработка'")
+        else:
+            X_train = st.session_state.X_train
+            X_test = st.session_state.X_test
+            y_train = st.session_state.y_train
+            y_test = st.session_state.y_test
+            
+            model_choice = st.selectbox(
+                "Выберите модель для оптимизации",
+                ["XGBoost", "Random Forest", "Logistic Regression", "Все модели"]
+            )
+            
+            if st.button("Начать оптимизацию", type="primary"):
+                if model_choice == "XGBoost":
+                    with st.spinner("Оптимизация XGBoost..."):
+                        model, params, study = xgb_optimize_multiclass_clf(
+                            X_train, y_train, X_test, y_test, n_trials
+                        )
+                        st.session_state.xgb_model = model
+                        st.session_state.xgb_params = params
+                        st.session_state.xgb_study = study
+                        st.session_state.current_model = "XGBoost"
+                        st.success("XGBoost оптимизирован!")
+                
+                elif model_choice == "Random Forest":
+                    with st.spinner("Оптимизация Random Forest..."):
+                        model, params, study = rf_optimize_multiclass_clf(
+                            X_train, y_train, X_test, y_test, n_trials
+                        )
+                        st.session_state.rf_model = model
+                        st.session_state.rf_params = params
+                        st.session_state.rf_study = study
+                        st.session_state.current_model = "Random Forest"
+                        st.success("Random Forest оптимизирован!")
+                
+                elif model_choice == "Logistic Regression":
+                    with st.spinner("Оптимизация Logistic Regression..."):
+                        model, params, study = lr_optimize_multiclass_clf(
+                            X_train, y_train, X_test, y_test, n_trials
+                        )
+                        st.session_state.lr_model = model
+                        st.session_state.lr_params = params
+                        st.session_state.lr_study = study
+                        st.session_state.current_model = "Logistic Regression"
+                        st.success("Logistic Regression оптимизирован!")
+                
+                elif model_choice == "Все модели":
+                    with st.spinner("Оптимизация всех моделей..."):
+                        # XGBoost
+                        xgb_model, xgb_params, xgb_study = xgb_optimize_multiclass_clf(
+                            X_train, y_train, X_test, y_test, n_trials
+                        )
+                        st.session_state.xgb_model = xgb_model
+                        st.session_state.xgb_params = xgb_params
+                        st.session_state.xgb_study = xgb_study
+                        
+                        # Random Forest
+                        rf_model, rf_params, rf_study = rf_optimize_multiclass_clf(
+                            X_train, y_train, X_test, y_test, n_trials
+                        )
+                        st.session_state.rf_model = rf_model
+                        st.session_state.rf_params = rf_params
+                        st.session_state.rf_study = rf_study
+                        
+                        # Logistic Regression
+                        lr_model, lr_params, lr_study = lr_optimize_multiclass_clf(
+                            X_train, y_train, X_test, y_test, n_trials
+                        )
+                        st.session_state.lr_model = lr_model
+                        st.session_state.lr_params = lr_params
+                        st.session_state.lr_study = lr_study
+                        
+                        st.session_state.current_model = "Все модели"
+                        st.success("Все модели оптимизированы!")
+    
+    # Результаты
+    with tab3:
+        st.header("Результаты моделирования")
+        
+        if 'current_model' not in st.session_state:
+            st.info("Сначала выполните оптимизацию моделей на вкладке 'Моделирование'")
+        else:
+            X_test = st.session_state.X_test
+            y_test = st.session_state.y_test
+            n_classes = len(np.unique(y_test))
+            
+            if st.session_state.current_model in ["XGBoost", "Все модели"] and 'xgb_model' in st.session_state:
+                st.subheader("XGBoost")
+                xgb_model = st.session_state.xgb_model
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**Лучшие параметры:**")
+                    for key, value in st.session_state.xgb_params.items():
+                        st.write(f"{key}: {value}")
+                
+                y_pred_xgb = xgb_model.predict(X_test)
+                y_proba_xgb = xgb_model.predict_proba(X_test)
+                
+                with col2:
+                    accuracy = accuracy_score(y_test, y_pred_xgb)
+                    recall = recall_score(y_test, y_pred_xgb, average='weighted')
+                    f1 = f1_score(y_test, y_pred_xgb, average='weighted')
+                    
+                    st.metric("Accuracy", f"{accuracy:.3f}")
+                    st.metric("Recall", f"{recall:.3f}")
+                    st.metric("F1-Score", f"{f1:.3f}")
+                
+                # Матрица ошибок
+                fig, ax = plt.subplots(figsize=(8, 6))
+                cm = confusion_matrix(y_test, y_pred_xgb)
+                disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+                disp.plot(ax=ax, cmap='Blues')
+                ax.set_title("Матрица ошибок - XGBoost")
+                st.pyplot(fig)
+                
+                # ROC-кривые для многоклассовой
+                if n_classes > 2:
+                    y_test_bin = LabelBinarizer().fit_transform(y_test)
+                    fpr = dict()
+                    tpr = dict()
+                    roc_auc = dict()
+                    
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    for i in range(n_classes):
+                        fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_proba_xgb[:, i])
+                        roc_auc[i] = auc(fpr[i], tpr[i])
+                        ax.plot(fpr[i], tpr[i], lw=2,
+                               label=f'Класс {i} (AUC = {roc_auc[i]:.2f})')
+                    
+                    ax.plot([0, 1], [0, 1], 'k--', lw=2)
+                    ax.set_xlim([0.0, 1.0])
+                    ax.set_ylim([0.0, 1.05])
+                    ax.set_xlabel('False Positive Rate')
+                    ax.set_ylabel('True Positive Rate')
+                    ax.set_title('ROC-кривые - XGBoost')
+                    ax.legend(loc="lower right")
+                    ax.grid(True, alpha=0.3)
+                    st.pyplot(fig)
+                
+                st.markdown("---")
+            
+            if st.session_state.current_model in ["Random Forest", "Все модели"] and 'rf_model' in st.session_state:
+                st.subheader("Random Forest")
+                rf_model = st.session_state.rf_model
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**Лучшие параметры:**")
+                    for key, value in st.session_state.rf_params.items():
+                        st.write(f"{key}: {value}")
+                
+                y_pred_rf = rf_model.predict(X_test)
+                y_proba_rf = rf_model.predict_proba(X_test)
+                
+                with col2:
+                    accuracy = accuracy_score(y_test, y_pred_rf)
+                    recall = recall_score(y_test, y_pred_rf, average='weighted')
+                    f1 = f1_score(y_test, y_pred_rf, average='weighted')
+                    
+                    st.metric("Accuracy", f"{accuracy:.3f}")
+                    st.metric("Recall", f"{recall:.3f}")
+                    st.metric("F1-Score", f"{f1:.3f}")
+                
+                # Матрица ошибок
+                fig, ax = plt.subplots(figsize=(8, 6))
+                cm = confusion_matrix(y_test, y_pred_rf)
+                disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+                disp.plot(ax=ax, cmap='Blues')
+                ax.set_title("Матрица ошибок - Random Forest")
+                st.pyplot(fig)
+                
+                # Важность признаков для Random Forest
+                if hasattr(rf_model, 'feature_importances_'):
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    feature_importances = rf_model.feature_importances_
+                    indices = np.argsort(feature_importances)[::-1]
+                    
+                    ax.bar(range(len(feature_importances)), feature_importances[indices])
+                    ax.set_xlabel("Индекс признака")
+                    ax.set_ylabel("Важность")
+                    ax.set_title("Важность признаков - Random Forest")
+                    ax.grid(True, alpha=0.3)
+                    st.pyplot(fig)
+                
+                st.markdown("---")
+            
+            if st.session_state.current_model in ["Logistic Regression", "Все модели"] and 'lr_model' in st.session_state:
+                st.subheader("Logistic Regression")
+                lr_model = st.session_state.lr_model
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**Лучшие параметры:**")
+                    for key, value in st.session_state.lr_params.items():
+                        st.write(f"{key}: {value}")
+                
+                y_pred_lr = lr_model.predict(X_test)
+                y_proba_lr = lr_model.predict_proba(X_test)
+                
+                with col2:
+                    accuracy = accuracy_score(y_test, y_pred_lr)
+                    recall = recall_score(y_test, y_pred_lr, average='weighted')
+                    f1 = f1_score(y_test, y_pred_lr, average='weighted')
+                    
+                    st.metric("Accuracy", f"{accuracy:.3f}")
+                    st.metric("Recall", f"{recall:.3f}")
+                    st.metric("F1-Score", f"{f1:.3f}")
+                
+                # Матрица ошибок
+                fig, ax = plt.subplots(figsize=(8, 6))
+                cm = confusion_matrix(y_test, y_pred_lr)
+                disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+                disp.plot(ax=ax, cmap='Blues')
+                ax.set_title("Матрица ошибок - Logistic Regression")
+                st.pyplot(fig)
+                
+                st.markdown("---")
+            
+            # Сравнение моделей если все оптимизированы
+            if st.session_state.current_model == "Все модели" and \
+               all(key in st.session_state for key in ['xgb_model', 'rf_model', 'lr_model']):
+                st.subheader("Сравнение моделей")
+                
+                models = {
+                    "XGBoost": st.session_state.xgb_model,
+                    "Random Forest": st.session_state.rf_model,
+                    "Logistic Regression": st.session_state.lr_model
+                }
+                
+                results = []
+                for name, model in models.items():
+                    y_pred = model.predict(X_test)
+                    results.append({
+                        "Модель": name,
+                        "Accuracy": accuracy_score(y_test, y_pred),
+                        "Recall": recall_score(y_test, y_pred, average='weighted'),
+                        "F1-Score": f1_score(y_test, y_pred, average='weighted')
+                    })
+                
+                results_df = pd.DataFrame(results)
+                st.dataframe(results_df.style.format({
+                    "Accuracy": "{:.3f}",
+                    "Recall": "{:.3f}",
+                    "F1-Score": "{:.3f}"
+                }))
+                
+                # Визуализация сравнения
+                fig, ax = plt.subplots(figsize=(10, 6))
+                x = np.arange(len(results_df))
+                width = 0.25
+                
+                ax.bar(x - width, results_df['Accuracy'], width, label='Accuracy')
+                ax.bar(x, results_df['Recall'], width, label='Recall')
+                ax.bar(x + width, results_df['F1-Score'], width, label='F1-Score')
+                
+                ax.set_xlabel('Модели')
+                ax.set_ylabel('Значение метрики')
+                ax.set_title('Сравнение моделей')
+                ax.set_xticks(x)
+                ax.set_xticklabels(results_df['Модель'])
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                st.pyplot(fig)
+
+if __name__ == "__main__":
+    main()
